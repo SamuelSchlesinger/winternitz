@@ -2,6 +2,12 @@ use sha2::{Sha256, Digest};
 use rand::{RngCore, rngs::OsRng};
 use std::fmt;
 
+/// Maximum security parameter (hash output length in bytes)
+pub const MAX_N: usize = 32;
+
+/// Maximum length of chains for most practical use cases
+pub const MAX_LEN: usize = 128;
+
 #[derive(Debug)]
 pub enum WotsError {
     InvalidWinternitzParameter,
@@ -9,6 +15,7 @@ pub enum WotsError {
     InvalidSignature,
     InvalidChainParameters,
     Verification,
+    BufferTooSmall,
 }
 
 impl fmt::Display for WotsError {
@@ -19,36 +26,41 @@ impl fmt::Display for WotsError {
             WotsError::InvalidSignature => write!(f, "Invalid signature length"),
             WotsError::InvalidChainParameters => write!(f, "Invalid chain parameters"),
             WotsError::Verification => write!(f, "Signature verification failed"),
+            WotsError::BufferTooSmall => write!(f, "Buffer too small for operation"),
         }
     }
 }
 
 impl std::error::Error for WotsError {}
 
-pub struct WinternitzOTS {
-    w: u32,           // Winternitz parameter (must be a power of 2)
-    n: usize,         // Security parameter (hash output length in bytes)
-    log_w: u32,       // Log base 2 of w
-    len_1: usize,     // Number of w-bit blocks for message digest
-    len_2: usize,     // Number of w-bit blocks for checksum
-    len: usize,       // Total number of blocks (len_1 + len_2)
-    private_key: Option<Vec<Vec<u8>>>,
-    public_key: Option<Vec<Vec<u8>>>,
+/// Winternitz OTS with fixed-size arrays to avoid heap allocations
+pub struct WinternitzOTS<const N: usize, const L: usize> {
+    w: u32,                           // Winternitz parameter (must be a power of 2)
+    log_w: u32,                       // Log base 2 of w
+    len_1: usize,                     // Number of w-bit blocks for message digest
+    len_2: usize,                     // Number of w-bit blocks for checksum
+    len: usize,                       // Total number of blocks (len_1 + len_2)
+    private_key: Option<[[u8; N]; L]>,
+    public_key: Option<[[u8; N]; L]>,
 }
 
-impl WinternitzOTS {
+impl<const N: usize, const L: usize> WinternitzOTS<N, L> {
     /// Create a new Winternitz One-Time Signature instance
-    pub fn new(w: u32, n: usize) -> Result<Self, WotsError> {
-        // Check if w is a power of 2
+    pub fn new(w: u32) -> Result<Self, WotsError> {
+        // Validate parameters
         if w < 2 || (w & (w - 1)) != 0 {
             return Err(WotsError::InvalidWinternitzParameter);
+        }
+        
+        if N == 0 || L == 0 {
+            return Err(WotsError::BufferTooSmall);
         }
         
         // Calculate derived parameters
         let log_w = w.trailing_zeros();
         
         // Number of w-bit blocks needed to represent n-byte message digest
-        let len_1 = ((8 * n) as f64 / log_w as f64).ceil() as usize;
+        let len_1 = ((8 * N) as f64 / log_w as f64).ceil() as usize;
         
         // Number of w-bit blocks needed for checksum
         let len_2 = ((((len_1 * (w as usize - 1)) as f64).log2() / log_w as f64).floor() as usize) + 1;
@@ -56,9 +68,12 @@ impl WinternitzOTS {
         // Total number of blocks
         let len = len_1 + len_2;
         
+        if len > L {
+            return Err(WotsError::BufferTooSmall);
+        }
+        
         Ok(WinternitzOTS {
             w,
-            n,
             log_w,
             len_1,
             len_2,
@@ -69,47 +84,55 @@ impl WinternitzOTS {
     }
     
     /// Hash function using SHA-256
-    fn hash(&self, data: &[u8]) -> Vec<u8> {
+    fn hash(&self, data: &[u8], output: &mut [u8; N]) {
         let mut hasher = Sha256::new();
         hasher.update(data);
-        hasher.finalize()[..self.n].to_vec()
+        output.copy_from_slice(&hasher.finalize()[..N]);
     }
     
     /// Apply the hash chain function
-    fn chain(&self, x: &[u8], start: u32, steps: u32) -> Result<Vec<u8>, WotsError> {
+    fn chain(&self, x: &[u8; N], start: u32, steps: u32, result: &mut [u8; N]) -> Result<(), WotsError> {
         if start >= self.w || steps > (self.w - start) {
             return Err(WotsError::InvalidChainParameters);
         }
         
-        let mut result = x.to_vec();
+        // Copy input to result buffer
+        result.copy_from_slice(x);
+        
+        // Apply hash chain
+        let mut buffer = [0u8; 2]; // For chain index
         for i in start..(start + steps) {
             // Prepend chain index to prevent potential multi-target attacks
-            let mut data = Vec::with_capacity(2 + result.len());
-            data.extend_from_slice(&(i as u16).to_be_bytes());
-            data.extend_from_slice(&result);
-            result = self.hash(&data);
+            buffer.copy_from_slice(&(i as u16).to_be_bytes());
+            
+            // Create hash input with chain index followed by current state
+            let mut hasher = Sha256::new();
+            hasher.update(&buffer);
+            hasher.update(&*result);
+            
+            // Update result
+            result.copy_from_slice(&hasher.finalize()[..N]);
         }
         
-        Ok(result)
+        Ok(())
     }
     
     /// Generate a new private-public key pair
     pub fn generate_keys(&mut self) -> Result<(), WotsError> {
-        // Generate private key: len random n-byte values
-        let mut private_key = Vec::with_capacity(self.len);
+        // Initialize private key array with random bytes
+        let mut private_key: [[u8; N]; L] = unsafe { std::mem::zeroed() };
         
-        for _ in 0..self.len {
-            let mut key = vec![0u8; self.n];
-            OsRng.fill_bytes(&mut key);
-            private_key.push(key);
+        // Generate random private keys
+        for i in 0..self.len {
+            OsRng.fill_bytes(&mut private_key[i]);
         }
         
-        // Generate public key: apply hash chain w-1 times to each private key element
-        let mut public_key = Vec::with_capacity(self.len);
+        // Initialize public key array
+        let mut public_key: [[u8; N]; L] = unsafe { std::mem::zeroed() };
         
+        // Generate public keys by applying hash chains
         for i in 0..self.len {
-            let pk = self.chain(&private_key[i], 0, self.w - 1)?;
-            public_key.push(pk);
+            self.chain(&private_key[i], 0, self.w - 1, &mut public_key[i])?;
         }
         
         self.private_key = Some(private_key);
@@ -119,130 +142,144 @@ impl WinternitzOTS {
     }
     
     /// Convert message digest to base w representation
-    fn convert_to_base_w(&self, msg_digest: &[u8]) -> Vec<u32> {
+    fn convert_to_base_w(&self, msg_digest: &[u8; N], result: &mut [u32; L]) {
         let bits_per_digit = self.log_w as usize;
-        let mut result = Vec::with_capacity(self.len_1);
+        let mut index = 0;
         
         // Process each byte of the message digest
-        for byte in msg_digest {
+        for &byte in msg_digest.iter() {
             let mut bits_remaining = 8;
-            let byte_value = *byte;
-            
-            while bits_remaining >= bits_per_digit {
+            while bits_remaining >= bits_per_digit && index < self.len_1 {
                 bits_remaining -= bits_per_digit;
                 // Extract bits_per_digit bits and convert to integer
-                let digit = (byte_value >> bits_remaining) & (self.w - 1) as u8;
-                result.push(digit as u32);
+                let digit = (byte >> bits_remaining) & (self.w - 1) as u8;
+                result[index] = digit as u32;
+                index += 1;
             }
         }
         
-        // If we need more digits, add them (padding)
-        while result.len() < self.len_1 {
-            result.push(0);
+        // Pad if needed
+        while index < self.len_1 {
+            result[index] = 0;
+            index += 1;
         }
-        
-        // Truncate if we got too many
-        result.truncate(self.len_1);
-        result
     }
     
     /// Compute checksum for the base w message representation
-    fn compute_checksum(&self, msg_base_w: &[u32]) -> Vec<u32> {
+    fn compute_checksum(&self, msg_base_w: &[u32; L], checksum_base_w: &mut [u32; L]) {
         // Compute checksum (sum of w-1 - digit for each digit)
-        let checksum: u32 = msg_base_w.iter()
-            .map(|&d| (self.w - 1) - d)
-            .sum();
+        let mut checksum: u32 = 0;
+        for i in 0..self.len_1 {
+            checksum += (self.w - 1) - msg_base_w[i];
+        }
         
         // Convert checksum to base w representation
-        let mut checksum_base_w = Vec::with_capacity(self.len_2);
+        let mut index = 0;
         let mut remaining_checksum = checksum;
         
-        while remaining_checksum > 0 || checksum_base_w.len() < self.len_2 {
-            checksum_base_w.push(remaining_checksum % self.w);
+        while (remaining_checksum > 0 || index < self.len_2) && index < self.len_2 {
+            checksum_base_w[index] = remaining_checksum % self.w;
             remaining_checksum /= self.w;
+            index += 1;
         }
         
-        // Pad to len_2
-        while checksum_base_w.len() < self.len_2 {
-            checksum_base_w.push(0);
+        // Pad if needed
+        while index < self.len_2 {
+            checksum_base_w[index] = 0;
+            index += 1;
+        }
+    }
+    
+    /// Combines message base-w representation and checksum into a single array
+    fn combine_msg_and_checksum(
+        &self,
+        msg_base_w: &[u32; L],
+        checksum_base_w: &[u32; L],
+        combined: &mut [u32; L]
+    ) {
+        // Copy message digits
+        for i in 0..self.len_1 {
+            combined[i] = msg_base_w[i];
         }
         
-        // Truncate if we got too many
-        checksum_base_w.truncate(self.len_2);
-        checksum_base_w
+        // Copy checksum digits
+        for i in 0..self.len_2 {
+            combined[self.len_1 + i] = checksum_base_w[i];
+        }
     }
     
     /// Sign a message using the Winternitz one-time signature scheme
-    pub fn sign(&self, message: &[u8]) -> Result<Vec<Vec<u8>>, WotsError> {
+    pub fn sign(&self, message: &[u8], signature: &mut [[u8; N]; L]) -> Result<(), WotsError> {
         let private_key = match &self.private_key {
             Some(key) => key,
             None => return Err(WotsError::KeysNotGenerated),
         };
         
         // Hash the message
-        let msg_digest = self.hash(message);
+        let mut msg_digest = [0u8; N];
+        self.hash(message, &mut msg_digest);
         
         // Convert to base w representation
-        let msg_base_w = self.convert_to_base_w(&msg_digest);
+        let mut msg_base_w = [0u32; L];
+        self.convert_to_base_w(&msg_digest, &mut msg_base_w);
         
         // Compute checksum and convert to base w
-        let checksum_base_w = self.compute_checksum(&msg_base_w);
+        let mut checksum_base_w = [0u32; L];
+        self.compute_checksum(&msg_base_w, &mut checksum_base_w);
         
         // Combine message and checksum digits
-        let mut combined = Vec::with_capacity(self.len);
-        combined.extend_from_slice(&msg_base_w);
-        combined.extend_from_slice(&checksum_base_w);
+        let mut combined = [0u32; L];
+        self.combine_msg_and_checksum(&msg_base_w, &checksum_base_w, &mut combined);
         
         // Generate signature: for each digit, apply hash chain 'digit' times
-        let mut signature = Vec::with_capacity(self.len);
-        
         for i in 0..self.len {
-            let sig = self.chain(&private_key[i], 0, combined[i])?;
-            signature.push(sig);
+            self.chain(&private_key[i], 0, combined[i], &mut signature[i])?;
         }
         
-        Ok(signature)
+        Ok(())
     }
     
     /// Verify a Winternitz one-time signature
-    pub fn verify(&self, message: &[u8], signature: &[Vec<u8>]) -> Result<bool, WotsError> {
+    pub fn verify(&self, message: &[u8], signature: &[[u8; N]; L]) -> Result<bool, WotsError> {
         let public_key = match &self.public_key {
             Some(key) => key,
             None => return Err(WotsError::KeysNotGenerated),
         };
         
-        if signature.len() != self.len {
-            return Err(WotsError::InvalidSignature);
-        }
-        
         // Hash the message
-        let msg_digest = self.hash(message);
+        let mut msg_digest = [0u8; N];
+        self.hash(message, &mut msg_digest);
         
         // Convert to base w representation
-        let msg_base_w = self.convert_to_base_w(&msg_digest);
+        let mut msg_base_w = [0u32; L];
+        self.convert_to_base_w(&msg_digest, &mut msg_base_w);
         
         // Compute checksum and convert to base w
-        let checksum_base_w = self.compute_checksum(&msg_base_w);
+        let mut checksum_base_w = [0u32; L];
+        self.compute_checksum(&msg_base_w, &mut checksum_base_w);
         
         // Combine message and checksum digits
-        let mut combined = Vec::with_capacity(self.len);
-        combined.extend_from_slice(&msg_base_w);
-        combined.extend_from_slice(&checksum_base_w);
+        let mut combined = [0u32; L];
+        self.combine_msg_and_checksum(&msg_base_w, &checksum_base_w, &mut combined);
         
         // Verify signature: for each digit, complete the hash chain to w-1 steps
-        let mut computed_public_key = Vec::with_capacity(self.len);
+        let mut computed_pk = [0u8; N];
         
         for i in 0..self.len {
-            let pk = self.chain(&signature[i], combined[i], self.w - 1 - combined[i])?;
-            computed_public_key.push(pk);
+            let remaining_steps = self.w - 1 - combined[i];
+            self.chain(&signature[i], combined[i], remaining_steps, &mut computed_pk)?;
+            
+            // Check if computed public key element matches the actual public key element
+            if computed_pk != public_key[i] {
+                return Ok(false);
+            }
         }
         
-        // Check if computed public key matches the actual public key
-        Ok(computed_public_key == *public_key)
+        Ok(true)
     }
     
     /// Get the public key
-    pub fn get_public_key(&self) -> Result<&Vec<Vec<u8>>, WotsError> {
+    pub fn get_public_key(&self) -> Result<&[[u8; N]; L], WotsError> {
         match &self.public_key {
             Some(key) => Ok(key),
             None => Err(WotsError::KeysNotGenerated),
@@ -250,33 +287,36 @@ impl WinternitzOTS {
     }
 }
 
-/// Enhanced Winternitz One-Time Signature Plus (WOTS+) implementation
-pub struct WinternitzOTSPlus {
-    w: u32,           // Winternitz parameter (must be a power of 2)
-    n: usize,         // Security parameter (hash output length in bytes)
-    log_w: u32,       // Log base 2 of w
-    len_1: usize,     // Number of w-bit blocks for message digest
-    len_2: usize,     // Number of w-bit blocks for checksum
-    len: usize,       // Total number of blocks (len_1 + len_2)
-    private_key: Option<Vec<Vec<u8>>>,
-    public_key: Option<Vec<Vec<u8>>>,
-    public_seed: Option<Vec<u8>>,
-    address_space: Option<Vec<Vec<u8>>>,
+/// Enhanced Winternitz One-Time Signature Plus (WOTS+) implementation with fixed-size arrays
+pub struct WinternitzOTSPlus<const N: usize, const L: usize> {
+    w: u32,                           // Winternitz parameter (must be a power of 2)
+    log_w: u32,                       // Log base 2 of w
+    len_1: usize,                     // Number of w-bit blocks for message digest
+    len_2: usize,                     // Number of w-bit blocks for checksum
+    len: usize,                       // Total number of blocks (len_1 + len_2)
+    private_key: Option<[[u8; N]; L]>,
+    public_key: Option<[[u8; N]; L]>,
+    public_seed: Option<[u8; N]>,
+    secret_seed: Option<[u8; N]>,
 }
 
-impl WinternitzOTSPlus {
+impl<const N: usize, const L: usize> WinternitzOTSPlus<N, L> {
     /// Create a new Winternitz One-Time Signature Plus instance
-    pub fn new(w: u32, n: usize) -> Result<Self, WotsError> {
-        // Check if w is a power of 2
+    pub fn new(w: u32) -> Result<Self, WotsError> {
+        // Validate parameters
         if w < 2 || (w & (w - 1)) != 0 {
             return Err(WotsError::InvalidWinternitzParameter);
+        }
+        
+        if N == 0 || L == 0 {
+            return Err(WotsError::BufferTooSmall);
         }
         
         // Calculate derived parameters
         let log_w = w.trailing_zeros();
         
         // Number of w-bit blocks needed to represent n-byte message digest
-        let len_1 = ((8 * n) as f64 / log_w as f64).ceil() as usize;
+        let len_1 = ((8 * N) as f64 / log_w as f64).ceil() as usize;
         
         // Number of w-bit blocks needed for checksum
         let len_2 = ((((len_1 * (w as usize - 1)) as f64).log2() / log_w as f64).floor() as usize) + 1;
@@ -284,9 +324,12 @@ impl WinternitzOTSPlus {
         // Total number of blocks
         let len = len_1 + len_2;
         
+        if len > L {
+            return Err(WotsError::BufferTooSmall);
+        }
+        
         Ok(WinternitzOTSPlus {
             w,
-            n,
             log_w,
             len_1,
             len_2,
@@ -294,36 +337,37 @@ impl WinternitzOTSPlus {
             private_key: None,
             public_key: None,
             public_seed: None,
-            address_space: None,
+            secret_seed: None,
         })
     }
     
     /// Hash function using SHA-256
-    fn hash(&self, data: &[u8]) -> Vec<u8> {
+    fn hash(&self, data: &[u8], output: &mut [u8; N]) {
         let mut hasher = Sha256::new();
         hasher.update(data);
-        hasher.finalize()[..self.n].to_vec()
+        output.copy_from_slice(&hasher.finalize()[..N]);
     }
     
     /// Pseudorandom function for key generation
-    fn prf(&self, key: &[u8], addr: &[u8]) -> Vec<u8> {
+    fn prf(&self, key: &[u8; N], addr: u32, output: &mut [u8; N]) {
         let mut hasher = Sha256::new();
         hasher.update(key);
-        hasher.update(addr);
-        hasher.finalize()[..self.n].to_vec()
+        hasher.update(&addr.to_be_bytes());
+        output.copy_from_slice(&hasher.finalize()[..N]);
     }
     
     /// Keyed hash function for the WOTS+ chain
-    fn hash_with_seed(&self, public_seed: &[u8], addr: &[u8], data: &[u8]) -> Vec<u8> {
+    fn hash_with_seed(&self, public_seed: &[u8; N], addr: u32, chain_pos: u32, data: &[u8; N], output: &mut [u8; N]) {
         let mut hasher = Sha256::new();
         hasher.update(public_seed);
-        hasher.update(addr);
+        hasher.update(&addr.to_be_bytes());
+        hasher.update(&chain_pos.to_be_bytes());
         hasher.update(data);
-        hasher.finalize()[..self.n].to_vec()
+        output.copy_from_slice(&hasher.finalize()[..N]);
     }
     
     /// Apply the hash chain function for WOTS+
-    fn chain(&self, x: &[u8], start: u32, steps: u32, addr: &[u8]) -> Result<Vec<u8>, WotsError> {
+    fn chain(&self, x: &[u8; N], start: u32, steps: u32, addr: u32, result: &mut [u8; N]) -> Result<(), WotsError> {
         if start >= self.w || steps > (self.w - start) {
             return Err(WotsError::InvalidChainParameters);
         }
@@ -333,53 +377,47 @@ impl WinternitzOTSPlus {
             None => return Err(WotsError::KeysNotGenerated),
         };
         
-        let mut result = x.to_vec();
+        // Copy input to result buffer
+        result.copy_from_slice(x);
+        
+        // Apply hash chain
         for i in start..(start + steps) {
-            // Create a unique address for this chain position
-            let mut chain_addr = addr.to_vec();
-            chain_addr.extend_from_slice(&(i as u16).to_be_bytes());
-            
-            // Apply the keyed hash function
-            result = self.hash_with_seed(public_seed, &chain_addr, &result);
+            let mut tmp = [0u8; N];
+            // Create a temporary borrowing of result
+            let result_ref = &*result;
+            self.hash_with_seed(public_seed, addr, i, result_ref, &mut tmp);
+            // Copy the result back
+            result.copy_from_slice(&tmp);
         }
         
-        Ok(result)
+        Ok(())
     }
     
     /// Generate a new private-public key pair for WOTS+
     pub fn generate_keys(&mut self) -> Result<(), WotsError> {
         // Generate public seed for randomization
-        let mut public_seed = vec![0u8; self.n];
+        let mut public_seed = [0u8; N];
         OsRng.fill_bytes(&mut public_seed);
         self.public_seed = Some(public_seed);
         
-        // Generate address space (one address per hash chain)
-        let mut address_space = Vec::with_capacity(self.len);
-        for i in 0..self.len {
-            let addr = (i as u32).to_be_bytes().to_vec();
-            address_space.push(addr);
-        }
-        self.address_space = Some(address_space);
-        
         // Generate secret seed
-        let mut secret_seed = vec![0u8; self.n];
+        let mut secret_seed = [0u8; N];
         OsRng.fill_bytes(&mut secret_seed);
+        self.secret_seed = Some(secret_seed);
         
-        // Generate private key
-        let address_space = self.address_space.as_ref().unwrap();
-        let mut private_key = Vec::with_capacity(self.len);
+        // Generate private key using PRF
+        let mut private_key: [[u8; N]; L] = unsafe { std::mem::zeroed() };
+        let secret_seed_ref = self.secret_seed.as_ref().unwrap();
         
         for i in 0..self.len {
-            let key = self.prf(&secret_seed, &address_space[i]);
-            private_key.push(key);
+            self.prf(secret_seed_ref, i as u32, &mut private_key[i]);
         }
         
         // Generate public key: apply hash chain w-1 times to each private key element
-        let mut public_key = Vec::with_capacity(self.len);
+        let mut public_key: [[u8; N]; L] = unsafe { std::mem::zeroed() };
         
         for i in 0..self.len {
-            let pk = self.chain(&private_key[i], 0, self.w - 1, &address_space[i])?;
-            public_key.push(pk);
+            self.chain(&private_key[i], 0, self.w - 1, i as u32, &mut public_key[i])?;
         }
         
         self.private_key = Some(private_key);
@@ -389,140 +427,144 @@ impl WinternitzOTSPlus {
     }
     
     /// Convert message digest to base w representation
-    fn convert_to_base_w(&self, msg_digest: &[u8]) -> Vec<u32> {
+    fn convert_to_base_w(&self, msg_digest: &[u8; N], result: &mut [u32; L]) {
         let bits_per_digit = self.log_w as usize;
-        let mut result = Vec::with_capacity(self.len_1);
+        let mut index = 0;
         
         // Process each byte of the message digest
-        for byte in msg_digest {
+        for &byte in msg_digest.iter() {
             let mut bits_remaining = 8;
-            let byte_value = *byte;
-            
-            while bits_remaining >= bits_per_digit {
+            while bits_remaining >= bits_per_digit && index < self.len_1 {
                 bits_remaining -= bits_per_digit;
                 // Extract bits_per_digit bits and convert to integer
-                let digit = (byte_value >> bits_remaining) & (self.w - 1) as u8;
-                result.push(digit as u32);
+                let digit = (byte >> bits_remaining) & (self.w - 1) as u8;
+                result[index] = digit as u32;
+                index += 1;
             }
         }
         
-        // If we need more digits, add them (padding)
-        while result.len() < self.len_1 {
-            result.push(0);
+        // Pad if needed
+        while index < self.len_1 {
+            result[index] = 0;
+            index += 1;
         }
-        
-        // Truncate if we got too many
-        result.truncate(self.len_1);
-        result
     }
     
     /// Compute checksum for the base w message representation
-    fn compute_checksum(&self, msg_base_w: &[u32]) -> Vec<u32> {
+    fn compute_checksum(&self, msg_base_w: &[u32; L], checksum_base_w: &mut [u32; L]) {
         // Compute checksum (sum of w-1 - digit for each digit)
-        let checksum: u32 = msg_base_w.iter()
-            .map(|&d| (self.w - 1) - d)
-            .sum();
+        let mut checksum: u32 = 0;
+        for i in 0..self.len_1 {
+            checksum += (self.w - 1) - msg_base_w[i];
+        }
         
         // Convert checksum to base w representation
-        let mut checksum_base_w = Vec::with_capacity(self.len_2);
+        let mut index = 0;
         let mut remaining_checksum = checksum;
         
-        while remaining_checksum > 0 || checksum_base_w.len() < self.len_2 {
-            checksum_base_w.push(remaining_checksum % self.w);
+        while (remaining_checksum > 0 || index < self.len_2) && index < self.len_2 {
+            checksum_base_w[index] = remaining_checksum % self.w;
             remaining_checksum /= self.w;
+            index += 1;
         }
         
-        // Pad to len_2
-        while checksum_base_w.len() < self.len_2 {
-            checksum_base_w.push(0);
+        // Pad if needed
+        while index < self.len_2 {
+            checksum_base_w[index] = 0;
+            index += 1;
+        }
+    }
+    
+    /// Combines message base-w representation and checksum into a single array
+    fn combine_msg_and_checksum(
+        &self,
+        msg_base_w: &[u32; L],
+        checksum_base_w: &[u32; L],
+        combined: &mut [u32; L]
+    ) {
+        // Copy message digits
+        for i in 0..self.len_1 {
+            combined[i] = msg_base_w[i];
         }
         
-        // Truncate if we got too many
-        checksum_base_w.truncate(self.len_2);
-        checksum_base_w
+        // Copy checksum digits
+        for i in 0..self.len_2 {
+            combined[self.len_1 + i] = checksum_base_w[i];
+        }
     }
     
     /// Sign a message using the Winternitz one-time signature plus scheme
-    pub fn sign(&self, message: &[u8]) -> Result<Vec<Vec<u8>>, WotsError> {
+    pub fn sign(&self, message: &[u8], signature: &mut [[u8; N]; L]) -> Result<(), WotsError> {
         let private_key = match &self.private_key {
             Some(key) => key,
             None => return Err(WotsError::KeysNotGenerated),
         };
         
-        let address_space = match &self.address_space {
-            Some(addr) => addr,
-            None => return Err(WotsError::KeysNotGenerated),
-        };
-        
         // Hash the message
-        let msg_digest = self.hash(message);
+        let mut msg_digest = [0u8; N];
+        self.hash(message, &mut msg_digest);
         
         // Convert to base w representation
-        let msg_base_w = self.convert_to_base_w(&msg_digest);
+        let mut msg_base_w = [0u32; L];
+        self.convert_to_base_w(&msg_digest, &mut msg_base_w);
         
         // Compute checksum and convert to base w
-        let checksum_base_w = self.compute_checksum(&msg_base_w);
+        let mut checksum_base_w = [0u32; L];
+        self.compute_checksum(&msg_base_w, &mut checksum_base_w);
         
         // Combine message and checksum digits
-        let mut combined = Vec::with_capacity(self.len);
-        combined.extend_from_slice(&msg_base_w);
-        combined.extend_from_slice(&checksum_base_w);
+        let mut combined = [0u32; L];
+        self.combine_msg_and_checksum(&msg_base_w, &checksum_base_w, &mut combined);
         
         // Generate signature: for each digit, apply hash chain 'digit' times
-        let mut signature = Vec::with_capacity(self.len);
-        
         for i in 0..self.len {
-            let sig = self.chain(&private_key[i], 0, combined[i], &address_space[i])?;
-            signature.push(sig);
+            self.chain(&private_key[i], 0, combined[i], i as u32, &mut signature[i])?;
         }
         
-        Ok(signature)
+        Ok(())
     }
     
     /// Verify a Winternitz one-time signature plus
-    pub fn verify(&self, message: &[u8], signature: &[Vec<u8>]) -> Result<bool, WotsError> {
+    pub fn verify(&self, message: &[u8], signature: &[[u8; N]; L]) -> Result<bool, WotsError> {
         let public_key = match &self.public_key {
             Some(key) => key,
             None => return Err(WotsError::KeysNotGenerated),
         };
         
-        let address_space = match &self.address_space {
-            Some(addr) => addr,
-            None => return Err(WotsError::KeysNotGenerated),
-        };
-        
-        if signature.len() != self.len {
-            return Err(WotsError::InvalidSignature);
-        }
-        
         // Hash the message
-        let msg_digest = self.hash(message);
+        let mut msg_digest = [0u8; N];
+        self.hash(message, &mut msg_digest);
         
         // Convert to base w representation
-        let msg_base_w = self.convert_to_base_w(&msg_digest);
+        let mut msg_base_w = [0u32; L];
+        self.convert_to_base_w(&msg_digest, &mut msg_base_w);
         
         // Compute checksum and convert to base w
-        let checksum_base_w = self.compute_checksum(&msg_base_w);
+        let mut checksum_base_w = [0u32; L];
+        self.compute_checksum(&msg_base_w, &mut checksum_base_w);
         
         // Combine message and checksum digits
-        let mut combined = Vec::with_capacity(self.len);
-        combined.extend_from_slice(&msg_base_w);
-        combined.extend_from_slice(&checksum_base_w);
+        let mut combined = [0u32; L];
+        self.combine_msg_and_checksum(&msg_base_w, &checksum_base_w, &mut combined);
         
         // Verify signature: for each digit, complete the hash chain to w-1 steps
-        let mut computed_public_key = Vec::with_capacity(self.len);
+        let mut computed_pk = [0u8; N];
         
         for i in 0..self.len {
-            let pk = self.chain(&signature[i], combined[i], self.w - 1 - combined[i], &address_space[i])?;
-            computed_public_key.push(pk);
+            let remaining_steps = self.w - 1 - combined[i];
+            self.chain(&signature[i], combined[i], remaining_steps, i as u32, &mut computed_pk)?;
+            
+            // Check if computed public key element matches the actual public key element
+            if computed_pk != public_key[i] {
+                return Ok(false);
+            }
         }
         
-        // Check if computed public key matches the actual public key
-        Ok(computed_public_key == *public_key)
+        Ok(true)
     }
     
     /// Get the public key
-    pub fn get_public_key(&self) -> Result<&Vec<Vec<u8>>, WotsError> {
+    pub fn get_public_key(&self) -> Result<&[[u8; N]; L], WotsError> {
         match &self.public_key {
             Some(key) => Ok(key),
             None => Err(WotsError::KeysNotGenerated),
@@ -530,7 +572,7 @@ impl WinternitzOTSPlus {
     }
     
     /// Get the public seed
-    pub fn get_public_seed(&self) -> Result<&Vec<u8>, WotsError> {
+    pub fn get_public_seed(&self) -> Result<&[u8; N], WotsError> {
         match &self.public_seed {
             Some(seed) => Ok(seed),
             None => Err(WotsError::KeysNotGenerated),
@@ -545,7 +587,7 @@ mod tests {
     #[test]
     fn test_winternitz_ots() -> Result<(), Box<dyn std::error::Error>> {
         // Create a Winternitz OTS instance with w=16
-        let mut wots = WinternitzOTS::new(16, 32)?;
+        let mut wots = WinternitzOTS::<32, 80>::new(16)?;
         
         // Generate keys
         wots.generate_keys()?;
@@ -554,7 +596,8 @@ mod tests {
         let message = b"This is a test message to be signed with Winternitz OTS";
         
         // Sign the message
-        let signature = wots.sign(message)?;
+        let mut signature = [[0u8; 32]; 80];
+        wots.sign(message, &mut signature)?;
         
         // Verify the signature
         let is_valid = wots.verify(message, &signature)?;
@@ -571,7 +614,7 @@ mod tests {
     #[test]
     fn test_winternitz_ots_plus() -> Result<(), Box<dyn std::error::Error>> {
         // Create a WOTS+ instance with w=16
-        let mut wots_plus = WinternitzOTSPlus::new(16, 32)?;
+        let mut wots_plus = WinternitzOTSPlus::<32, 80>::new(16)?;
         
         // Generate keys
         wots_plus.generate_keys()?;
@@ -580,7 +623,8 @@ mod tests {
         let message = b"This is a test message to be signed with Winternitz OTS";
         
         // Sign the message
-        let signature_plus = wots_plus.sign(message)?;
+        let mut signature_plus = [[0u8; 32]; 80];
+        wots_plus.sign(message, &mut signature_plus)?;
         
         // Verify the signature
         let is_valid = wots_plus.verify(message, &signature_plus)?;
